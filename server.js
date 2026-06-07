@@ -1,159 +1,112 @@
-/**
- * SOCKET.IO SERVER — Integration Layer
- * Wraps GameRoom with real-time transport via Socket.IO.
- *
- * Run:  node server.js
- * Deps: npm install express socket.io
- *
- * Event flow (client → server):
- *   join_room       { roomId, playerName }
- *   start_game      { roomId }
- *   choose_mutator  { roomId, mutatorId }
- *   submit_answer   { roomId, answer }
- *   next_round      { roomId }
- *   create_room     { maxPlayers, totalRounds, mutatorsEnabled }
- *   get_snapshot    { roomId }
- *
- * Event flow (server → client, broadcast to roomId):
- *   PLAYER_JOINED | PLAYER_LEFT
- *   MUTATOR_SELECTION | MUTATOR_CHOSEN | STEAL_APPLIED
- *   QUESTION_START | ANSWER_RECEIVED
- *   ROUND_RESULT
- *   GAME_OVER
- *   ERROR  { message }
- */
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
 
-const express = require("express");
-const http    = require("http");
-const { Server } = require("socket.io");
-const { GameRoom } = require("./gameStateManager");
+// Importamos los motores que te dio Claude
+const { GameRoom } = require('./gameStateManager'); 
 
-const app    = express();
+const app = express();
+app.use(cors());
+
 const server = http.createServer(app);
-const io     = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
 
-app.use(express.json());
-
-// ─── Room Registry ─────────────────────────────────────────────────────────────
-// Map<roomId, GameRoom>
+// Aquí guardaremos todas las salas activas
 const rooms = new Map();
 
-/** Generate a short unique room code */
-function generateRoomId() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
+// Función para generar un código de sala aleatorio (Ej: FT4X)
+function generateRoomCode() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let code = '';
+    for (let i = 0; i < 4; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return code;
 }
 
-// ─── REST: Create Room ─────────────────────────────────────────────────────────
-app.post("/api/create-room", (req, res) => {
-  const { maxPlayers = 10, totalRounds = 5, mutatorsEnabled = false } = req.body;
+io.on('connection', (socket) => {
+    console.log('Usuario conectado:', socket.id);
 
-  try {
-    const roomId  = generateRoomId();
-    const adminId = `admin_${roomId}`;          // Admin gets a token; handle auth properly in production
+    // 1. EVENTO: Crear Sala (Admin)
+    socket.on('create_room', (config) => {
+        let roomId = generateRoomCode();
+        // Nos aseguramos de que el código sea único
+        while (rooms.has(roomId)) {
+            roomId = generateRoomCode();
+        }
 
-    const room = new GameRoom({ roomId, adminId, maxPlayers, totalRounds, mutatorsEnabled });
+        // Creamos la instancia del juego usando el administrador de estados de Claude
+        const roomInstance = new GameRoom(roomId, config);
+        rooms.set(roomId, roomInstance);
 
-    // Wire up event broadcasting
-    room.onEvent = (event, payload) => {
-      io.to(roomId).emit(event, payload);
-    };
+        // El admin se une a la sala de Socket.IO
+        socket.join(roomId);
+        socket.roomId = roomId;
+        socket.isHost = true;
 
-    rooms.set(roomId, room);
+        // Le devolvemos el código al frontend
+        socket.emit('room_created', { roomId, config });
+        console.log(`Sala creada: ${roomId} por el host ${socket.id}`);
+    });
 
-    res.json({ ok: true, roomId, adminId });
-  } catch (err) {
-    res.status(400).json({ ok: false, error: err.message });
-  }
+    // 2. EVENTO: Unirse a Sala (Jugador)
+    socket.on('join_room', (data) => {
+        const { roomId, playerName } = data;
+        const room = rooms.get(roomId.toUpperCase());
+
+        if (!room) {
+            return socket.emit('room_error', { message: 'La sala no existe.' });
+        }
+
+        // Comprobar si la sala está llena (según el límite del admin)
+        if (room.players && room.players.size >= room.config.maxPlayers) {
+            return socket.emit('room_error', { message: 'La sala está llena.' });
+        }
+
+        // Unir al jugador a la sala de Socket.IO
+        socket.join(roomId);
+        socket.roomId = roomId;
+        socket.isHost = false;
+        socket.playerName = playerName;
+
+        // Agregamos el jugador a la lógica del juego de Claude
+        // (Asumiendo que tu gameStateManager tiene un método addPlayer o similar)
+        if (typeof room.addPlayer === 'function') {
+            room.addPlayer(socket.id, playerName);
+        } else if (room.players) {
+            room.players.set(socket.id, { name: playerName, score: 0 });
+        }
+
+        socket.emit('room_joined', { roomId, playerName });
+        
+        // Avisar a todos en la sala que entró alguien para actualizar el Lobby
+        io.to(roomId).emit('player_joined', { playerName, id: socket.id });
+    });
+
+    // Desconexión
+    socket.on('disconnect', () => {
+        console.log('Usuario desconectado:', socket.id);
+        if (socket.roomId && rooms.has(socket.roomId)) {
+            const room = rooms.get(socket.roomId);
+            if (socket.isHost) {
+                // Si el admin se va, se cierra la sala
+                io.to(socket.roomId).emit('room_error', { message: 'El administrador cerró la sala.' });
+                rooms.delete(socket.roomId);
+            } else {
+                if (room.players) room.players.delete(socket.id);
+                io.to(socket.roomId).emit('player_left', { id: socket.id });
+            }
+        }
+    });
 });
 
-// ─── REST: Room Snapshot ───────────────────────────────────────────────────────
-app.get("/api/room/:roomId/snapshot", (req, res) => {
-  const room = rooms.get(req.params.roomId);
-  if (!room) return res.status(404).json({ ok: false, error: "Room not found." });
-  res.json({ ok: true, snapshot: room.getSnapshot() });
-});
-
-// ─── Socket.IO ─────────────────────────────────────────────────────────────────
-io.on("connection", (socket) => {
-  console.log(`[CONNECT] ${socket.id}`);
-
-  // Helper: send error only to this socket
-  const err = (msg) => socket.emit("ERROR", { message: msg });
-
-  // ── Join Room ──────────────────────────────────────────────────────────────
-  socket.on("join_room", ({ roomId, playerName }) => {
-    const room = rooms.get(roomId);
-    if (!room) return err("Room not found.");
-
-    const result = room.addPlayer(socket.id, playerName);
-    if (!result.ok) return err(result.error);
-
-    socket.join(roomId);
-    socket.data.roomId     = roomId;
-    socket.data.playerName = playerName;
-
-    // Send current snapshot to the joining player only
-    socket.emit("ROOM_JOINED", { roomId, snapshot: room.getSnapshot() });
-  });
-
-  // ── Start Game (admin) ─────────────────────────────────────────────────────
-  socket.on("start_game", ({ roomId, adminId }) => {
-    const room = rooms.get(roomId);
-    if (!room) return err("Room not found.");
-
-    const result = room.startGame(adminId);
-    if (!result.ok) return err(result.error);
-  });
-
-  // ── Choose Mutator ─────────────────────────────────────────────────────────
-  socket.on("choose_mutator", ({ roomId, mutatorId }) => {
-    const room = rooms.get(roomId);
-    if (!room) return err("Room not found.");
-
-    const result = room.chooseMutator(socket.id, mutatorId);
-    if (!result.ok) return err(result.error);
-  });
-
-  // ── Submit Answer ──────────────────────────────────────────────────────────
-  socket.on("submit_answer", ({ roomId, answer }) => {
-    const room = rooms.get(roomId);
-    if (!room) return err("Room not found.");
-
-    const result = room.submitAnswer(socket.id, answer);
-    if (!result.ok) return err(result.error);
-  });
-
-  // ── Next Round (admin) ─────────────────────────────────────────────────────
-  socket.on("next_round", ({ roomId, adminId }) => {
-    const room = rooms.get(roomId);
-    if (!room) return err("Room not found.");
-
-    const result = room.nextRound(adminId);
-    if (!result.ok) return err(result.error);
-  });
-
-  // ── Get Snapshot ───────────────────────────────────────────────────────────
-  socket.on("get_snapshot", ({ roomId }) => {
-    const room = rooms.get(roomId);
-    if (!room) return err("Room not found.");
-    socket.emit("SNAPSHOT", room.getSnapshot());
-  });
-
-  // ── Disconnect ─────────────────────────────────────────────────────────────
-  socket.on("disconnect", () => {
-    const { roomId } = socket.data;
-    if (roomId) {
-      const room = rooms.get(roomId);
-      if (room) room.removePlayer(socket.id);
-    }
-    console.log(`[DISCONNECT] ${socket.id}`);
-  });
-});
-
-// ─── Start Server ──────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🎮 Falacia Game Server running on http://localhost:${PORT}`);
+    console.log(`Servidor corriendo en el puerto ${PORT}`);
 });
-
-module.exports = { app, server };
